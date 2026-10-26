@@ -1,0 +1,9 @@
+{
+ "cycle": 0,
+ "feature": null,
+ "phase": "IDLE",
+ "turn": "codex",
+ "updated_at": null,
+ "updated_by": "bootstrap",
+ "note": "尚未開始。由 codex 執行 `ta cycle-next <feature-slug>` 起跑第一個 feature。"
+}

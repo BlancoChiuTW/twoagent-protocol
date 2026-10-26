@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# ta — twoAgent 協定 CLI。兩個 agent 唯一被允許用來修改協定狀態的工具。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TA_DIR="$ROOT/.twoagent"
+STATE="$TA_DIR/state.json"
+LOG="$TA_DIR/log/handoff.log"
+MAIL="$TA_DIR/mailbox"
+
+# shellcheck source=/dev/null
+[ -f "$TA_DIR/config.sh" ] && . "$TA_DIR/config.sh"
+TEST_CMD="${TEST_CMD:-}"
+BDD_CMD="${BDD_CMD:-}"
+CODEX_PATHS="${CODEX_PATHS:-features tests}"
+CLAUDE_PATHS="${CLAUDE_PATHS:-src}"
+
+die() { printf 'ta: %s\n' "$*" >&2; exit 1; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+need_jq() { command -v jq >/dev/null || die "需要 jq，請先安裝"; }
+
+phase_owner() {
+  case "$1" in
+    SPEC|RED|REVIEW) echo codex ;;
+    GREEN|REFACTOR)  echo claude ;;
+    IDLE)            echo codex ;;
+    *) die "未知 phase: $1（合法值：SPEC RED GREEN REFACTOR REVIEW）" ;;
+  esac
+}
+
+me() {
+  if [ -n "${TA_AGENT:-}" ]; then echo "$TA_AGENT"; return; fi
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE_EXECPATH:-}" ]; then echo claude; return; fi
+  if [ -n "${CODEX_HOME:-}" ] || [ -n "${CODEX_SANDBOX:-}" ]; then echo codex; return; fi
+  die "無法判斷身分。請 export TA_AGENT=claude 或 TA_AGENT=codex"
+}
+
+other() { [ "$1" = claude ] && echo codex || echo claude; }
+
+get() { need_jq; jq -r ".$1 // empty" "$STATE"; }
+
+set_state() { # set_state <phase> <turn> <by> <note> [feature] [cycle]
+  need_jq
+  local tmp; tmp="$(mktemp)"
+  local filter='.phase=$p | .turn=$t | .updated_by=$b | .note=$n | .updated_at=$u'
+  local args=( --arg p "$1" --arg t "$2" --arg b "$3" --arg n "$4" --arg u "$(now)" )
+  if [ -n "${5:-}" ]; then args+=( --arg f "$5" ); filter+=' | .feature=$f'; fi
+  if [ -n "${6:-}" ]; then args+=( --argjson c "$6" ); filter+=' | .cycle=$c'; fi
+  jq "${args[@]}" "$filter" "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+}
+
+assert_my_turn() {
+  local turn; turn="$(get turn)"
+  [ "$turn" = "$(me)" ] || die "現在是 $turn 的回合，不是你（$(me)）。用 \`ta wait\` 等待，或請人類 \`ta force-turn\`。"
+}
+
+inbox_dir() { echo "$MAIL/to-$(me)"; }
+
+cmd_status() {
+  need_jq
+  printf '=== twoAgent status ===\n'
+  printf '我是      : %s\n' "$(me)"
+  printf 'cycle     : %s\n' "$(get cycle)"
+  printf 'feature   : %s\n' "$(get feature)"
+  printf 'phase     : %s (owner: %s)\n' "$(get phase)" "$(phase_owner "$(get phase)")"
+  printf 'turn      : %s%s\n' "$(get turn)" "$([ "$(get turn)" = "$(me)" ] && echo '   ← 輪到你' || echo '   (等待對方)')"
+  printf 'updated   : %s by %s\n' "$(get updated_at)" "$(get updated_by)"
+  printf 'note      : %s\n' "$(get note)"
+  local n; n="$(find "$(inbox_dir)" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)"
+  printf '未讀信件  : %s 封%s\n' "$n" "$([ "$n" -gt 0 ] && echo '   (ta inbox)' || echo '')"
+}
+
+cmd_inbox() {
+  local archive=0
+  [ "${1:-}" = "--archive" ] && archive=1
+  local d; d="$(inbox_dir)"
+  local files; files="$(find "$d" -maxdepth 1 -name '*.md' | sort)"
+  [ -z "$files" ] && { echo "（收件匣是空的）"; return; }
+  while IFS= read -r f; do
+    printf '\n────────── %s ──────────\n' "$(basename "$f")"
+    cat "$f"
+    [ "$archive" = 1 ] && mv "$f" "$MAIL/archive/"
+  done <<< "$files"
+  [ "$archive" = 1 ] && printf '\n(已歸檔 %s 封)\n' "$(wc -l <<< "$files")"
+  return 0
+}
+
+cmd_msg() { # ta msg <subject...>   body 從 stdin
+  [ $# -ge 1 ] || die "用法: ta msg \"<主旨>\"   （內文從 stdin 讀）"
+  local to; to="$(other "$(me)")"
+  local subject="$*"
+  local slug; slug="$(printf '%s' "$subject" | tr -cs '[:alnum:]' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//' | cut -c1-40)"
+  local f="$MAIL/to-$to/$(date -u +%Y%m%dT%H%M%SZ)-${slug:-msg}.md"
+  { printf '# %s\n\n' "$subject"
+    printf '> from: %s | phase: %s | feature: %s | %s\n\n' "$(me)" "$(get phase)" "$(get feature)" "$(now)"
+    cat
+  } > "$f"
+  printf 'ta: 已送出 → %s\n' "${f#"$ROOT"/}"
+}
+
+cmd_test() {
+  local rc=0
+  if [ -z "$TEST_CMD" ] && [ -z "$BDD_CMD" ]; then
+    printf 'ta: .twoagent/config.sh 還沒設定 TEST_CMD / BDD_CMD。\n' >&2
+    printf 'ta: 選定技術棧後填進去；在那之前紅綠燈無法自動驗證。\n' >&2
+    return 2
+  fi
+  if [ -n "$TEST_CMD" ]; then
+    printf '\n─── TDD: %s ───\n' "$TEST_CMD"
+    ( cd "$ROOT" && eval "$TEST_CMD" ) || rc=1
+  fi
+  if [ -n "$BDD_CMD" ]; then
+    printf '\n─── BDD: %s ───\n' "$BDD_CMD"
+    ( cd "$ROOT" && eval "$BDD_CMD" ) || rc=1
+  fi
+  printf '\n─── 結果: %s ───\n' "$([ $rc = 0 ] && echo '🟢 GREEN' || echo '🔴 RED')"
+  return $rc
+}
+
+cmd_handoff() { # ta handoff <phase> [note...]
+  [ $# -ge 1 ] || die "用法: ta handoff <SPEC|RED|GREEN|REFACTOR|REVIEW> [備註]"
+  assert_my_turn
+  local next="$1"; shift
+  local note="${*:-}"
+  local owner; owner="$(phase_owner "$next")"
+  local from_phase; from_phase="$(get phase)"
+  set_state "$next" "$owner" "$(me)" "$note"
+  printf '%s | cycle=%s feature=%s | %s(%s) → %s(%s) | %s\n' \
+    "$(now)" "$(get cycle)" "$(get feature)" "$from_phase" "$(me)" "$next" "$owner" "$note" >> "$LOG"
+  printf 'ta: %s → %s，現在輪到 %s\n' "$from_phase" "$next" "$owner"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    printf 'ta: ⚠ working tree 還有未 commit 的改動。交棒前應該先：\n'
+    printf 'ta:    git add -A && git commit -m "[%s] %s"\n' "$from_phase" "${note:-...}"
+  fi
+}
+
+cmd_cycle_next() { # ta cycle-next <feature-slug>
+  [ $# -ge 1 ] || die "用法: ta cycle-next <feature-slug>"
+  assert_my_turn
+  need_jq
+  local c; c=$(( $(get cycle) + 1 ))
+  set_state SPEC codex "$(me)" "新 feature 開跑" "$1" "$c"
+  printf '%s | cycle=%s feature=%s | ── 新循環開始 ──\n' "$(now)" "$c" "$1" >> "$LOG"
+  printf 'ta: cycle %s 開始，feature=%s，phase=SPEC（codex）\n' "$c" "$1"
+}
+
+cmd_wait() { # ta wait [timeout-secs]
+  local timeout="${1:-600}" waited=0 mine; mine="$(me)"
+  if [ "$(get turn)" = "$mine" ]; then cmd_status; return 0; fi
+  printf 'ta: 等待 %s 交棒…（timeout %ss，Ctrl-C 可中斷）\n' "$(get turn)" "$timeout"
+  while [ "$(get turn)" != "$mine" ]; do
+    sleep 5; waited=$(( waited + 5 ))
+    [ "$waited" -ge "$timeout" ] && die "等待逾時（${timeout}s）。對方可能卡住了。"
+  done
+  printf '\nta: 🔔 輪到你了\n\n'
+  cmd_status
+  printf '\n'
+  cmd_inbox
+}
+
+cmd_force_turn() { # 人類專用
+  [ $# -ge 1 ] || die "用法: ta force-turn <claude|codex>"
+  set_state "$(get phase)" "$1" "human" "人類強制切換"
+  printf 'ta: 已強制切換 turn=%s\n' "$1"
+}
+
+cmd_log() { tail -n "${1:-20}" "$LOG" 2>/dev/null || echo "(尚無紀錄)"; }
+
+usage() {
+  cat <<'EOF'
+ta — twoAgent 協定 CLI
+
+  ta status                    看目前狀態、輪到誰、有幾封信
+  ta wait [secs]               阻塞等到輪到自己（預設 600s），醒來自動印狀態+收件匣
+  ta inbox [--archive]         讀收件匣；--archive 讀完歸檔
+  ta msg "<主旨>"              寫信給對方，內文從 stdin 讀
+  ta test                      跑 TEST_CMD + BDD_CMD，回報 🔴/🟢
+  ta handoff <PHASE> [備註]    交棒到下個 phase（會擋非本人回合）
+  ta cycle-next <feature>      驗收通過後開下一個 feature（cycle+1，phase=SPEC）
+  ta log [n]                   看最近 n 筆交棒紀錄
+  ta force-turn <agent>        人類介入：強制切換回合
+
+  身分來自 $TA_AGENT（tmux 窗格已預設好），phase 合法值：
+  SPEC RED (codex) → GREEN REFACTOR (claude) → REVIEW (codex)
+EOF
+}
+
+case "${1:-status}" in
+  status)     shift 2>/dev/null || true; cmd_status ;;
+  wait)       shift; cmd_wait "$@" ;;
+  inbox)      shift; cmd_inbox "$@" ;;
+  msg)        shift; cmd_msg "$@" ;;
+  test)       shift 2>/dev/null || true; cmd_test ;;
+  handoff)    shift; cmd_handoff "$@" ;;
+  cycle-next) shift; cmd_cycle_next "$@" ;;
+  log)        shift; cmd_log "$@" ;;
+  force-turn) shift; cmd_force_turn "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "未知指令: $1（ta --help）" ;;
+esac

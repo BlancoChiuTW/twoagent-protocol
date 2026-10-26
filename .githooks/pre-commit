@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# twoAgent 路徑歸屬守門員。
+# 依據 $TA_AGENT（而非 state.json 的 turn）判斷 —— 因為交棒後 turn 已翻面，
+# 但 commit 仍屬於前一位 agent，用 turn 判會誤殺。
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=/dev/null
+[ -f "$ROOT/.twoagent/config.sh" ] && . "$ROOT/.twoagent/config.sh"
+CODEX_PATHS="${CODEX_PATHS:-features tests}"
+CLAUDE_PATHS="${CLAUDE_PATHS:-src}"
+
+if [ "${TA_OVERRIDE:-}" = "1" ]; then
+  echo "pre-commit: ⚠ TA_OVERRIDE=1，跳過路徑檢查。請在 commit message 說明理由。" >&2
+  exit 0
+fi
+
+agent="${TA_AGENT:-}"
+if [ -z "$agent" ]; then
+  [ -n "${CLAUDECODE:-}${CLAUDE_CODE_EXECPATH:-}" ] && agent=claude
+  [ -n "${CODEX_HOME:-}${CODEX_SANDBOX:-}" ] && agent=codex
+fi
+# 人類自己 commit：不設限
+[ -z "$agent" ] && exit 0
+
+case "$agent" in
+  claude) forbidden="$CODEX_PATHS";  role="實作者(綠燈)"; ownr="codex" ;;
+  codex)  forbidden="$CLAUDE_PATHS"; role="出題者(紅燈)"; ownr="claude" ;;
+  *) exit 0 ;;
+esac
+
+staged="$(git diff --cached --name-only)"
+[ -z "$staged" ] && exit 0
+
+violations=""
+for p in $forbidden; do
+  hit="$(printf '%s\n' "$staged" | grep -E "^$p/" || true)"
+  [ -n "$hit" ] && violations+="$hit"$'\n'
+done
+
+if [ -n "${violations%$'\n'}" ]; then
+  cat >&2 <<EOF
+
+╭─ pre-commit 擋下 ────────────────────────────────────────────
+│ 你是 $agent（$role），不得修改 $ownr 擁有的路徑：$forbidden
+│
+│ 越界的檔案：
+$(printf '%s' "$violations" | sed '/^$/d;s/^/│   /')
+│
+│ 依協定 .twoagent/protocol.md §2：
+│   對測試/規格有異議 → ta msg 寫信說明 → ta handoff 交回去，
+│   不要自己改。
+│
+│ 真的需要繞過：TA_OVERRIDE=1 git commit ... （並在訊息說明理由）
+╰──────────────────────────────────────────────────────────────
+
+EOF
+  exit 1
+fi
+exit 0

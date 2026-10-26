@@ -1,0 +1,10 @@
+# 信箱歸檔屬於執行紀錄，不進版控
+.twoagent/mailbox/archive/*
+!.twoagent/mailbox/archive/.gitkeep
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+node_modules/
+.DS_Store
